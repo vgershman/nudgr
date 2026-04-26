@@ -172,8 +172,11 @@ async def _transcribe_message(
         )
         return ""
 
+    # Map media type to a file extension Whisper accepts.
+    ext_map = {"voice": ".ogg", "audio": ".mp3", "video_note": ".mp4", "video": ".mp4"}
+    ext = ext_map.get(kind, ".ogg")
     with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / f"{file_id}.bin"
+        dest = Path(tmp) / f"{file_id}{ext}"
         try:
             await download_telegram_file(bot, file_id, dest)
         except ValueError as e:
@@ -541,24 +544,27 @@ async def _strip_buttons_and_append(query: CallbackQuery, footer: str) -> None:
 
 def _build_dispatcher(router: LLMRouter, bot: Bot) -> Dispatcher:
     dp = Dispatcher()
-    dp.message.register(lambda m: cmd_start(m, bot), CommandStart())
-    dp.message.register(lambda m: cmd_help(m, bot), Command("help"))
-    dp.message.register(lambda m: cmd_list(m, bot), Command("list"))
-    dp.message.register(lambda m: cmd_tz(m, bot), Command("tz"))
+    # Make LLMRouter available to handlers via aiogram dependency injection.
+    dp["router"] = router
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_list, Command("list"))
+    dp.message.register(cmd_tz, Command("tz"))
 
     # Voice / audio / video / video_note → transcribe + parse
     dp.message.register(
-        lambda m: handle_message(m, bot, router),
+        handle_message,
         F.voice | F.audio | F.video_note | F.video,
     )
     # Free-form text (not a slash command)
     dp.message.register(
-        lambda m: handle_message(m, bot, router),
+        handle_message,
         F.text & ~F.text.startswith("/"),
     )
 
     dp.callback_query.register(
-        lambda q: cb_action(q, bot),
+        cb_action,
         F.data.func(
             lambda d: any(
                 (d or "").startswith(prefix + ":") for prefix in ALL_CALLBACK_PREFIXES
