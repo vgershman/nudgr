@@ -198,8 +198,11 @@ async def _transcribe_message(
         )
         return ""
 
+    # Map media type to a file extension Whisper accepts.
+    ext_map = {"voice": ".ogg", "audio": ".mp3", "video_note": ".mp4", "video": ".mp4"}
+    ext = ext_map.get(kind, ".ogg")
     with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / f"{file_id}.bin"
+        dest = Path(tmp) / f"{file_id}{ext}"
         try:
             await download_telegram_file(bot, file_id, dest)
         except ValueError as e:
@@ -840,6 +843,13 @@ def _build_dispatcher(router: LLMRouter, bot: Bot) -> Dispatcher:
     dp.message.register(cmd_invites, Command("invites"))
     dp.message.register(lambda m: cmd_quiet(m, bot), Command("quiet"))
     dp.message.register(lambda m: cmd_digest(m, bot), Command("digest"))
+    # Make LLMRouter available to handlers via aiogram dependency injection.
+    dp["router"] = router
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_list, Command("list"))
+    dp.message.register(cmd_tz, Command("tz"))
 
     # Voice / audio / video / video_note → transcribe + parse
     dp.message.register(
