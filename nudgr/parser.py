@@ -123,7 +123,7 @@ async def parse(
         )
 
     intent = str(data.get("intent") or "unclear").lower()
-    if intent not in ("remind", "list", "cancel", "done", "unclear"):
+    if intent not in ("remind", "list", "cancel", "done", "edit", "unclear"):
         intent = "unclear"
 
     target_text = str(data.get("target_text") or "").strip()[:300]
@@ -136,12 +136,25 @@ async def parse(
     # If the recurrence is valid but the model forgot to fill `when`, derive the
     # first fire from the rule itself. This is the common case for "every day at 9am".
     if recurrence is not None and fire_at is None:
+        # Seed fired_count=1 so chained instances start counting from 2.
+        seeded = {**recurrence, "fired_count": int(recurrence.get("fired_count", 1))}
+        recurrence = seeded
         fire_at = next_occurrence(recurrence, datetime.now(timezone.utc), effective_tz)
+
+    # Stamp fired_count=1 on freshly-created recurring rules — chained instances
+    # increment via advance_for_chain in the scheduler.
+    if recurrence is not None and "fired_count" not in recurrence:
+        recurrence = {**recurrence, "fired_count": 1}
 
     # Sanity: if intent=remind but no fire_at and no clarification, force clarification.
     if intent == "remind" and fire_at is None and not needs_clar:
         needs_clar = True
         clar_q = clar_q or "When should I remind you? Try '30m', '2h', or 'tomorrow 9am'."
+
+    # Edit intent must come with a new `when`. Otherwise force clarification.
+    if intent == "edit" and fire_at is None and not needs_clar:
+        needs_clar = True
+        clar_q = clar_q or "What time should I move it to?"
 
     return ParsedIntent(
         intent=intent,

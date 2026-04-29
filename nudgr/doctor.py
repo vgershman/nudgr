@@ -29,11 +29,17 @@ async def _check_config() -> Check:
         missing.append("OPENAI_API_KEY")
     if not settings.telegram_bot_token.get_secret_value():
         missing.append("TELEGRAM_BOT_TOKEN")
-    if settings.telegram_user_id == 0:
-        missing.append("TELEGRAM_USER_ID")
+    # v3: admin set must be non-empty (env list ∪ legacy single-tenant id).
+    admins = settings.admin_ids()
+    if not admins:
+        missing.append("TELEGRAM_ADMIN_IDS (or TELEGRAM_USER_ID)")
     if missing:
         return Check("config", False, f"missing env vars: {', '.join(missing)}")
-    return Check("config", True, "all required env vars present")
+    return Check(
+        "config",
+        True,
+        f"all required env vars present (admins: {sorted(admins)})",
+    )
 
 
 def _check_db() -> Check:

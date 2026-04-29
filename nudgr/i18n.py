@@ -75,6 +75,42 @@ _LABELS: dict[str, dict[str, str]] = {
         "wd_weekdays": "weekdays",
         "wd_weekends": "weekends",
         "wd_daily": "daily",
+        # Invites (v3)
+        "invite_redeemed": "✓ Welcome! You're in.",
+        "invite_already_active": "You're already activated — go ahead and send a reminder.",
+        "invite_expired": "That invite code has expired. Ask your admin for a new one.",
+        "invite_used": "That invite code has already been used.",
+        "invite_unknown": "Unknown invite code. Try again or ask your admin.",
+        "invite_required": (
+            "🔒 This bot is private. Ask the admin for an invite code, then send "
+            "<code>/start &lt;CODE&gt;</code>."
+        ),
+        "invite_admin_only": "Only admins can do that.",
+        "invite_issued": (
+            "🎟 New invite code:\n\n<code>{code}</code>\n\n"
+            "Share this with the person you're inviting. They redeem it via "
+            "<code>/start {code}</code>{expires}."
+        ),
+        "invite_issued_expires": " (expires {at})",
+        "invite_list_empty": "No active invite codes. Issue one with /invite.",
+        "invite_list_header": "Active invite codes:",
+        # Quiet hours / digest (v2 — used by P3)
+        "quiet_set": "🌙 Quiet hours: <b>{from_t}–{to_t}</b> (local). Pings landing inside this window are deferred.",
+        "quiet_cleared": "🌙 Quiet hours cleared.",
+        "quiet_current": "🌙 Quiet hours: <b>{from_t}–{to_t}</b> (local). Clear with <code>/quiet off</code>.",
+        "quiet_none": "🌙 No quiet hours set. Try <code>/quiet 23:00 07:00</code>.",
+        "quiet_invalid": "Couldn't read that — try <code>/quiet 23:00 07:00</code> or <code>/quiet off</code>.",
+        "digest_set": "📰 Daily digest at <b>{at}</b> (local).",
+        "digest_cleared": "📰 Daily digest off.",
+        "digest_current": "📰 Daily digest at <b>{at}</b> (local). Clear with <code>/digest off</code>.",
+        "digest_none": "📰 No daily digest set. Try <code>/digest 08:00</code>.",
+        "digest_invalid": "Couldn't read that — try <code>/digest 08:00</code> or <code>/digest off</code>.",
+        "digest_header": "📰 <b>Daily digest</b>",
+        # Edit (v2 — used by P2)
+        "edit_done": "✓ Updated <b>{text}</b> — next at {at}.",
+        "edit_no_match": "No active reminder matches '{hint}'.",
+        "btn_skip_next": "⏭ Skip next",
+        "decision_skipped": "⏭ Skipped. Next at {at}.",
     },
     "ru": {
         "welcome": (
@@ -119,6 +155,41 @@ _LABELS: dict[str, dict[str, str]] = {
         "wd_weekdays": "будни",
         "wd_weekends": "выходные",
         "wd_daily": "ежедневно",
+        # Invites (v3)
+        "invite_redeemed": "✓ Добро пожаловать! Доступ открыт.",
+        "invite_already_active": "Уже активирован — пришли напоминание.",
+        "invite_expired": "Срок действия кода истёк. Попроси новый у админа.",
+        "invite_used": "Этот код уже использован.",
+        "invite_unknown": "Неизвестный код приглашения. Попробуй ещё раз или попроси админа.",
+        "invite_required": (
+            "🔒 Бот приватный. Попроси админа выдать код приглашения и пришли "
+            "<code>/start &lt;КОД&gt;</code>."
+        ),
+        "invite_admin_only": "Только администратор может это сделать.",
+        "invite_issued": (
+            "🎟 Новый код приглашения:\n\n<code>{code}</code>\n\n"
+            "Передай его приглашённому — он введёт <code>/start {code}</code>{expires}."
+        ),
+        "invite_issued_expires": " (истекает {at})",
+        "invite_list_empty": "Нет активных кодов. Создай через /invite.",
+        "invite_list_header": "Активные коды приглашений:",
+        # Quiet hours / digest (v2 — used by P3)
+        "quiet_set": "🌙 Тихие часы: <b>{from_t}–{to_t}</b> (локально). Пинги в этом окне будут отложены.",
+        "quiet_cleared": "🌙 Тихие часы отключены.",
+        "quiet_current": "🌙 Тихие часы: <b>{from_t}–{to_t}</b> (локально). Отключить: <code>/quiet off</code>.",
+        "quiet_none": "🌙 Тихие часы не заданы. Например: <code>/quiet 23:00 07:00</code>.",
+        "quiet_invalid": "Не разобрал — попробуй <code>/quiet 23:00 07:00</code> или <code>/quiet off</code>.",
+        "digest_set": "📰 Ежедневная сводка в <b>{at}</b> (локально).",
+        "digest_cleared": "📰 Ежедневная сводка отключена.",
+        "digest_current": "📰 Ежедневная сводка в <b>{at}</b> (локально). Отключить: <code>/digest off</code>.",
+        "digest_none": "📰 Ежедневная сводка не настроена. Например: <code>/digest 08:00</code>.",
+        "digest_invalid": "Не разобрал — попробуй <code>/digest 08:00</code> или <code>/digest off</code>.",
+        "digest_header": "📰 <b>Ежедневная сводка</b>",
+        # Edit (v2 — used by P2)
+        "edit_done": "✓ Обновлено <b>{text}</b> — следующий пинг {at}.",
+        "edit_no_match": "Нет активного напоминания по «{hint}».",
+        "btn_skip_next": "⏭ Пропустить",
+        "decision_skipped": "⏭ Пропущено. Следующий {at}.",
     },
 }
 

@@ -32,17 +32,25 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 
+from nudgr.auth import (
+    is_active_user,
+    is_admin_telegram_id,
+    is_authorized_telegram_id,
+)
 from nudgr.config import settings
 from nudgr.db.models import Reminder, User
 from nudgr.db.session import session_scope
 from nudgr.i18n import detect_locale, label, supported_locales
+from nudgr.invites import issue_invite, list_active_invites, redeem_invite
 from nudgr.llm.router import LLMRouter
 from nudgr.observability.logging import logger
 from nudgr.parser import ParsedIntent, parse
+from nudgr.quiet import defer_for_user, parse_hhmm
 from nudgr.recurrence import rule_summary
 from nudgr.scheduler import (
     ALL_CALLBACK_PREFIXES,
     CB_DONE,
+    CB_SKIP_NEXT,
     CB_SNOOZE_2H,
     CB_SNOOZE_30,
     CB_SNOOZE_TOM,
@@ -50,7 +58,10 @@ from nudgr.scheduler import (
     mark_done,
     mark_stopped,
     parse_callback_data,
+    reschedule,
+    run_digest_scheduler,
     run_scheduler,
+    skip_next_recurrence,
     snooze,
     snooze_until_tomorrow_9am,
 )
@@ -62,7 +73,10 @@ from nudgr.transcribe import download_telegram_file, transcribe_file
 
 
 def _is_authorized(user_id: int | None) -> bool:
-    return user_id is not None and user_id == settings.telegram_user_id
+    """v3: admins (env-listed) OR existing active users. /start with a valid
+    invite code activates a user — until then, non-admins see "Not authorized."
+    """
+    return is_authorized_telegram_id(user_id)
 
 
 def _upsert_user(
@@ -75,7 +89,12 @@ def _upsert_user(
 
     If `detected_locale` is provided AND differs from the stored value, persist
     it. v1: locale auto-switches with the user's language.
+
+    v3: admins are auto-flipped to is_active=true on first sight so they don't
+    need to redeem their own invite. Non-admins are inserted as is_active=false
+    and stay that way until /start <code> redemption.
     """
+    is_admin = is_admin_telegram_id(telegram_user_id)
     with session_scope() as s:
         existing = s.execute(
             select(User).where(User.telegram_user_id == telegram_user_id)
@@ -86,12 +105,19 @@ def _upsert_user(
             if detected_locale and detected_locale in supported_locales():
                 if existing.preferred_locale != detected_locale:
                     existing.preferred_locale = detected_locale
+            # Admin promotion is sticky (env may have changed since insert).
+            if is_admin and not existing.is_active:
+                existing.is_active = True
+                if existing.joined_at is None:
+                    existing.joined_at = datetime.now(timezone.utc)
             return existing.id, existing.preferred_locale or "en", existing.timezone or "UTC"
         user = User(
             telegram_user_id=telegram_user_id,
             telegram_username=telegram_username,
             timezone=settings.timezone,
             preferred_locale=detected_locale if detected_locale in supported_locales() else "en",
+            is_active=is_admin,  # admins are active immediately; others wait for invite
+            joined_at=datetime.now(timezone.utc) if is_admin else None,
         )
         s.add(user)
         s.flush()
@@ -214,19 +240,105 @@ def _format_local_time(dt: datetime, tz_name: str) -> str:
 
 
 async def cmd_start(message: Message, bot: Bot) -> None:
+    """`/start` — activate (admin), or `/start <code>` — redeem an invite.
+
+    Non-admin users without an invite code (or with a bad one) get the "invite
+    required" message and stay inactive. Admins always pass.
+    """
     uid = message.from_user.id if message.from_user else 0
-    if not _is_authorized(uid):
-        await message.answer("Not authorized.")
+    if uid == 0:
         return
+    raw_text = message.text or ""
+    detected = detect_locale(raw_text)
     username = message.from_user.username if message.from_user else None
-    detected = detect_locale(message.text or "")
+
+    # Always create a row so we can track who tried (and so redeem_invite has
+    # a target). Non-admins start as is_active=false.
     user_id, locale, _tz = _upsert_user(uid, username, detected_locale=detected)
+
+    # /start <code> path — try to redeem.
+    parts = raw_text.split(maxsplit=1)
+    code_arg = parts[1].strip() if len(parts) > 1 else ""
+    if code_arg and not is_admin_telegram_id(uid):
+        ok, reason_key = redeem_invite(code=code_arg, redeemer_id=user_id)
+        if not ok:
+            await message.answer(label(reason_key, locale))
+            return
+        # Fall through to welcome (active now).
+
+    # Auth gate: admin OR newly-active OR previously-active.
+    if not (is_admin_telegram_id(uid) or is_active_user(user_id)):
+        await message.answer(label("invite_required", locale), parse_mode=ParseMode.HTML)
+        return
+
     await message.answer(label("welcome", locale), parse_mode=ParseMode.HTML)
     await _refresh_summary(bot, user_id, message.chat.id, locale)
 
 
 async def cmd_help(message: Message, bot: Bot) -> None:
     await cmd_start(message, bot)
+
+
+async def cmd_invite(message: Message) -> None:
+    """`/invite` — admin-only. Issue a fresh single-use invite code."""
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin_telegram_id(uid):
+        # Distinct message from the generic "Not authorized" — admins know they
+        # exist; non-admins shouldn't even know the command does something.
+        if _is_authorized(uid):
+            detected = detect_locale(message.text or "")
+            user_id, locale, _ = _upsert_user(
+                uid,
+                message.from_user.username if message.from_user else None,
+                detected_locale=detected,
+            )
+            await message.answer(label("invite_admin_only", locale))
+        return
+    detected = detect_locale(message.text or "")
+    user_id, locale, _tz = _upsert_user(
+        uid,
+        message.from_user.username if message.from_user else None,
+        detected_locale=detected,
+    )
+    try:
+        code, expires_at = issue_invite(created_by=user_id)
+    except RuntimeError as e:
+        logger.error(f"invite issue failed: {e}")
+        await message.answer("Couldn't generate a code right now — try again.")
+        return
+    expires_clause = ""
+    if expires_at is not None:
+        expires_clause = label(
+            "invite_issued_expires",
+            locale,
+            at=expires_at.strftime("%Y-%m-%d %H:%M UTC"),
+        )
+    await message.answer(
+        label("invite_issued", locale, code=code, expires=expires_clause),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_invites(message: Message) -> None:
+    """`/invites` — admin-only. List unused, unexpired codes you've issued."""
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin_telegram_id(uid):
+        return
+    detected = detect_locale(message.text or "")
+    user_id, locale, _tz = _upsert_user(
+        uid,
+        message.from_user.username if message.from_user else None,
+        detected_locale=detected,
+    )
+    rows = list_active_invites(created_by=user_id)
+    if not rows:
+        await message.answer(label("invite_list_empty", locale))
+        return
+    lines = [label("invite_list_header", locale)]
+    for r in rows:
+        exp = r.expires_at.strftime("%Y-%m-%d") if r.expires_at else "—"
+        lines.append(f"<code>{r.code}</code>  · expires {exp}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_list(message: Message, bot: Bot) -> None:
@@ -275,6 +387,117 @@ async def cmd_tz(message: Message, bot: Bot) -> None:
         label("tz_set", locale, tz=candidate), parse_mode=ParseMode.HTML
     )
     await _refresh_summary(bot, user_id, message.chat.id, locale)
+
+
+async def cmd_quiet(message: Message, bot: Bot) -> None:
+    """`/quiet` — show config; `/quiet HH:MM HH:MM` — set; `/quiet off` — clear."""
+    if not _is_authorized(message.from_user.id if message.from_user else None):
+        return
+    detected = detect_locale(message.text or "")
+    user_id, locale, _tz = _upsert_user(
+        message.from_user.id,
+        message.from_user.username if message.from_user else None,
+        detected_locale=detected,
+    )
+    parts = (message.text or "").split()
+    # /quiet → show
+    if len(parts) == 1:
+        with session_scope() as s:
+            user = s.get(User, user_id)
+            qf, qt = (user.quiet_from, user.quiet_to) if user else (None, None)
+        if qf is None or qt is None:
+            await message.answer(label("quiet_none", locale), parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(
+                label(
+                    "quiet_current",
+                    locale,
+                    from_t=qf.strftime("%H:%M"),
+                    to_t=qt.strftime("%H:%M"),
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    # /quiet off
+    if len(parts) == 2 and parts[1].lower() in ("off", "none", "clear", "выкл", "off."):
+        with session_scope() as s:
+            user = s.get(User, user_id)
+            if user is not None:
+                user.quiet_from = None
+                user.quiet_to = None
+        await message.answer(label("quiet_cleared", locale))
+        return
+    # /quiet HH:MM HH:MM
+    if len(parts) >= 3:
+        qf = parse_hhmm(parts[1])
+        qt = parse_hhmm(parts[2])
+        if qf is None or qt is None or qf == qt:
+            await message.answer(
+                label("quiet_invalid", locale), parse_mode=ParseMode.HTML
+            )
+            return
+        with session_scope() as s:
+            user = s.get(User, user_id)
+            if user is not None:
+                user.quiet_from = qf
+                user.quiet_to = qt
+        await message.answer(
+            label(
+                "quiet_set",
+                locale,
+                from_t=qf.strftime("%H:%M"),
+                to_t=qt.strftime("%H:%M"),
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await message.answer(label("quiet_invalid", locale), parse_mode=ParseMode.HTML)
+
+
+async def cmd_digest(message: Message, bot: Bot) -> None:
+    """`/digest` — show; `/digest HH:MM` — set; `/digest off` — clear."""
+    if not _is_authorized(message.from_user.id if message.from_user else None):
+        return
+    detected = detect_locale(message.text or "")
+    user_id, locale, _tz = _upsert_user(
+        message.from_user.id,
+        message.from_user.username if message.from_user else None,
+        detected_locale=detected,
+    )
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        with session_scope() as s:
+            user = s.get(User, user_id)
+            d = user.digest_local_time if user else None
+        if d is None:
+            await message.answer(label("digest_none", locale), parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(
+                label("digest_current", locale, at=d.strftime("%H:%M")),
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    if parts[1].lower() in ("off", "none", "clear", "выкл"):
+        with session_scope() as s:
+            user = s.get(User, user_id)
+            if user is not None:
+                user.digest_local_time = None
+                user.last_digest_at = None  # reset dedup so re-enable behaves as expected
+        await message.answer(label("digest_cleared", locale))
+        return
+    t = parse_hhmm(parts[1])
+    if t is None:
+        await message.answer(label("digest_invalid", locale), parse_mode=ParseMode.HTML)
+        return
+    with session_scope() as s:
+        user = s.get(User, user_id)
+        if user is not None:
+            user.digest_local_time = t
+            # Reset dedup so the new time fires today if it's still ahead.
+            user.last_digest_at = None
+    await message.answer(
+        label("digest_set", locale, at=t.strftime("%H:%M")), parse_mode=ParseMode.HTML
+    )
 
 
 async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
@@ -346,12 +569,26 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
             message, bot, user_id, parsed.target_text, mark="done", locale=locale
         )
         return
+    if parsed.intent == "edit":
+        await _handle_edit(
+            message,
+            bot,
+            user_id,
+            hint=parsed.target_text,
+            new_fire_at=parsed.fire_at,
+            locale=locale,
+            tz_name=tz_name,
+        )
+        return
 
     if parsed.intent == "remind":
         if parsed.fire_at is None:
             await message.answer(label("when_clarify", locale))
             return
-        # Persist reminder.
+        # Persist reminder. Quiet hours push next_ping_at past the current
+        # silenced window if necessary; the canonical fire_at is preserved so
+        # skip-next / future chains anchor to the user's intended slot.
+        deferred_next = defer_for_user(parsed.fire_at, user_id)
         with session_scope() as s:
             reminder = Reminder(
                 user_id=user_id,
@@ -360,7 +597,7 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
                 transcript=transcript,
                 input_kind=kind,
                 fire_at=parsed.fire_at,
-                next_ping_at=parsed.fire_at,
+                next_ping_at=deferred_next,
                 recurrence=parsed.recurrence,
                 status="active",
             )
@@ -398,6 +635,50 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
 
     # Should be unreachable.
     await message.answer(label("parse_failed", locale))
+
+
+async def _handle_edit(
+    message: Message,
+    bot: Bot,
+    user_id: UUID,
+    *,
+    hint: str,
+    new_fire_at: datetime | None,
+    locale: str,
+    tz_name: str,
+) -> None:
+    """Fuzzy-match an active reminder by `hint` and move it to `new_fire_at`."""
+    if not hint or new_fire_at is None:
+        await message.answer(label("when_clarify", locale))
+        return
+    needle = hint.strip().lower()
+    target_id: UUID | None = None
+    text_out: str | None = None
+    with session_scope() as s:
+        candidates = list(
+            s.execute(
+                select(Reminder)
+                .where(Reminder.user_id == user_id)
+                .where(Reminder.status == "active")
+                .order_by(Reminder.next_ping_at)
+            ).scalars()
+        )
+        match = next((r for r in candidates if needle in (r.text or "").lower()), None)
+        if match is None:
+            await message.answer(label("edit_no_match", locale, hint=hint))
+            return
+        target_id = match.id
+        text_out = match.text
+    new_at = reschedule(target_id, new_fire_at)
+    if new_at is None:
+        await message.answer(label("decision_already_closed", locale))
+        return
+    eta_at = _format_eta(new_at, locale, tz_name)
+    await message.answer(
+        label("edit_done", locale, text=text_out or "", at=eta_at),
+        parse_mode=ParseMode.HTML,
+    )
+    await _refresh_summary(bot, user_id, message.chat.id, locale)
 
 
 async def _handle_cancel_or_done(
@@ -499,6 +780,16 @@ async def cb_action(query: CallbackQuery, bot: Bot) -> None:
     elif action == CB_SNOOZE_TOM:
         new_at = snooze_until_tomorrow_9am(reminder_id)
         await _emit_snooze_outcome(query, new_at, locale, tz_name)
+    elif action == CB_SKIP_NEXT:
+        new_at = skip_next_recurrence(reminder_id)
+        if new_at is None:
+            await _strip_buttons_and_append(query, "")
+            await _safe_answer(query, label("decision_already_closed", locale))
+        else:
+            at_local = _format_local_time(new_at, tz_name)
+            msg = label("decision_skipped", locale, at=at_local)
+            await _strip_buttons_and_append(query, f"\n\n<i>{msg}</i>")
+            await _safe_answer(query, msg)
     else:
         await _safe_answer(query, "Unknown action.", alert=True)
         return
@@ -545,6 +836,10 @@ def _build_dispatcher(router: LLMRouter, bot: Bot) -> Dispatcher:
     dp.message.register(lambda m: cmd_help(m, bot), Command("help"))
     dp.message.register(lambda m: cmd_list(m, bot), Command("list"))
     dp.message.register(lambda m: cmd_tz(m, bot), Command("tz"))
+    dp.message.register(cmd_invite, Command("invite"))
+    dp.message.register(cmd_invites, Command("invites"))
+    dp.message.register(lambda m: cmd_quiet(m, bot), Command("quiet"))
+    dp.message.register(lambda m: cmd_digest(m, bot), Command("digest"))
 
     # Voice / audio / video / video_note → transcribe + parse
     dp.message.register(
@@ -579,15 +874,18 @@ async def run_bot() -> None:
     router = LLMRouter()
     dp = _build_dispatcher(router, bot)
     scheduler_task = asyncio.create_task(run_scheduler(bot))
+    digest_task = asyncio.create_task(run_digest_scheduler(bot))
 
     try:
         logger.info("nudgr bot starting (polling)…")
         # drop_pending_updates=True: ignore queued updates from when the bot was offline.
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
-        scheduler_task.cancel()
-        try:
-            await scheduler_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        for task in (scheduler_task, digest_task):
+            task.cancel()
+        for task in (scheduler_task, digest_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await bot.session.close()

@@ -101,26 +101,37 @@ def send_test(
     from nudgr.db.session import session_scope
     from sqlalchemy import select
 
-    if settings.telegram_user_id == 0:
-        logger.error("TELEGRAM_USER_ID not set — can't insert test reminder.")
-        raise typer.Exit(code=2)
+    target_id = settings.telegram_user_id
+    if target_id == 0:
+        # v3: fall back to the first admin in TELEGRAM_ADMIN_IDS so deploys
+        # that skipped the legacy single-tenant id still work for send-test.
+        admins = sorted(settings.admin_ids())
+        if not admins:
+            logger.error(
+                "No admin Telegram IDs configured (TELEGRAM_USER_ID / "
+                "TELEGRAM_ADMIN_IDS) — can't insert test reminder."
+            )
+            raise typer.Exit(code=2)
+        target_id = admins[0]
 
     fire_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     with session_scope() as s:
         user = s.execute(
-            select(User).where(User.telegram_user_id == settings.telegram_user_id)
+            select(User).where(User.telegram_user_id == target_id)
         ).scalar_one_or_none()
         if user is None:
             user = User(
-                telegram_user_id=settings.telegram_user_id,
+                telegram_user_id=target_id,
                 timezone=settings.timezone,
+                is_active=True,
+                joined_at=datetime.now(timezone.utc),
             )
             s.add(user)
             s.flush()
         s.add(
             Reminder(
                 user_id=user.id,
-                chat_id=settings.telegram_user_id,
+                chat_id=target_id,
                 text=text,
                 input_kind="text",
                 fire_at=fire_at,
