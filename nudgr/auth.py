@@ -43,10 +43,20 @@ def lookup_telegram_user(telegram_user_id: int) -> User | None:
 
 
 def is_authorized_telegram_id(telegram_user_id: int | None) -> bool:
-    """True iff the Telegram user is an admin OR an existing active user."""
-    if telegram_user_id is None:
+    """True iff the Telegram user is allowed to interact with the bot.
+
+    Authorization rules:
+      - Admins (TELEGRAM_ADMIN_IDS) always pass.
+      - When OPEN_REGISTRATION=true, ANY non-zero Telegram id passes — the
+        user gets auto-activated by the upsert path on first message.
+      - Otherwise, only previously-activated users pass (those who redeemed
+        an invite code).
+    """
+    if telegram_user_id is None or telegram_user_id == 0:
         return False
     if is_admin_telegram_id(telegram_user_id):
+        return True
+    if settings.open_registration:
         return True
     u = lookup_telegram_user(telegram_user_id)
     return bool(u and u.is_active)

@@ -29,7 +29,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy import select
 
 from nudgr.auth import (
@@ -45,6 +50,13 @@ from nudgr.invites import issue_invite, list_active_invites, redeem_invite
 from nudgr.llm.router import LLMRouter
 from nudgr.observability.logging import logger
 from nudgr.parser import ParsedIntent, parse
+from nudgr.pending import (
+    CB_CANCEL_PENDING,
+    clear_pending,
+    get_pending,
+    update_clarification_message_id,
+    upsert_pending,
+)
 from nudgr.quiet import defer_for_user, parse_hhmm
 from nudgr.recurrence import rule_summary
 from nudgr.scheduler import (
@@ -90,11 +102,15 @@ def _upsert_user(
     If `detected_locale` is provided AND differs from the stored value, persist
     it. v1: locale auto-switches with the user's language.
 
-    v3: admins are auto-flipped to is_active=true on first sight so they don't
-    need to redeem their own invite. Non-admins are inserted as is_active=false
-    and stay that way until /start <code> redemption.
+    Activation rules:
+      - Admins (TELEGRAM_ADMIN_IDS) are always active.
+      - When OPEN_REGISTRATION=true (the default), every user is auto-active
+        on first sight — no invite needed.
+      - When OPEN_REGISTRATION=false, non-admins start as is_active=false and
+        stay that way until /start <code> redemption.
     """
     is_admin = is_admin_telegram_id(telegram_user_id)
+    auto_active = is_admin or settings.open_registration
     with session_scope() as s:
         existing = s.execute(
             select(User).where(User.telegram_user_id == telegram_user_id)
@@ -105,8 +121,9 @@ def _upsert_user(
             if detected_locale and detected_locale in supported_locales():
                 if existing.preferred_locale != detected_locale:
                     existing.preferred_locale = detected_locale
-            # Admin promotion is sticky (env may have changed since insert).
-            if is_admin and not existing.is_active:
+            # Activation is sticky once set, but env may have changed mode —
+            # promote inactive users when the policy now allows them.
+            if auto_active and not existing.is_active:
                 existing.is_active = True
                 if existing.joined_at is None:
                     existing.joined_at = datetime.now(timezone.utc)
@@ -116,8 +133,8 @@ def _upsert_user(
             telegram_username=telegram_username,
             timezone=settings.timezone,
             preferred_locale=detected_locale if detected_locale in supported_locales() else "en",
-            is_active=is_admin,  # admins are active immediately; others wait for invite
-            joined_at=datetime.now(timezone.utc) if is_admin else None,
+            is_active=auto_active,
+            joined_at=datetime.now(timezone.utc) if auto_active else None,
         )
         s.add(user)
         s.flush()
@@ -259,18 +276,26 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     # a target). Non-admins start as is_active=false.
     user_id, locale, _tz = _upsert_user(uid, username, detected_locale=detected)
 
-    # /start <code> path — try to redeem.
+    # /start <code> path — try to redeem (still useful even in open mode for
+    # tracking who-invited-whom). Admins skip redemption.
     parts = raw_text.split(maxsplit=1)
     code_arg = parts[1].strip() if len(parts) > 1 else ""
     if code_arg and not is_admin_telegram_id(uid):
         ok, reason_key = redeem_invite(code=code_arg, redeemer_id=user_id)
-        if not ok:
+        if not ok and not settings.open_registration:
+            # In private mode a bad code is fatal. In open mode it's harmless
+            # — the user is already active via _upsert_user — so we fall through.
             await message.answer(label(reason_key, locale))
             return
-        # Fall through to welcome (active now).
+        # Fall through to welcome.
 
-    # Auth gate: admin OR newly-active OR previously-active.
-    if not (is_admin_telegram_id(uid) or is_active_user(user_id)):
+    # Auth gate: in open mode _upsert_user already activated us; in private
+    # mode we additionally require admin or successful redemption.
+    if not (
+        settings.open_registration
+        or is_admin_telegram_id(uid)
+        or is_active_user(user_id)
+    ):
         await message.answer(label("invite_required", locale), parse_mode=ParseMode.HTML)
         return
 
@@ -545,9 +570,16 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
         if user is not None and user.preferred_locale != locale and locale in supported_locales():
             user.preferred_locale = locale
 
+    # v2.5: pull any pending clarification context for this user. The parser
+    # is told about it so it can merge the new reply with the prior partial.
+    pending = get_pending(user_id)
+    pending_context: dict | None = pending.context if pending else None
+
     parsed: ParsedIntent
     try:
-        parsed = await parse(text, router, tz_name=tz_name)
+        parsed = await parse(
+            text, router, tz_name=tz_name, pending_context=pending_context
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception(f"parse failed: {e}")
         await message.answer(label("parse_failed", locale))
@@ -558,21 +590,66 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
         return
 
     if parsed.intent == "unclear" or parsed.needs_clarification:
-        prompt = parsed.clarification_question or label("when_clarify", locale)
-        await message.answer(f"❓ {prompt}")
+        # Stash a pending so the user's NEXT message can complete this intent.
+        # The clarification message gets a Cancel button so they can abort.
+        pending_target = parsed.target_text or (
+            pending.context.get("target_text") if pending else ""
+        )
+        question = parsed.clarification_question or label(
+            "clarify_pending_default_q", locale
+        )
+        # Build the snapshot we'll feed back to the parser on the next turn.
+        new_context = {
+            "target_text": pending_target,
+            "recurrence": parsed.recurrence,
+            "fire_at_iso": parsed.fire_at.isoformat() if parsed.fire_at else None,
+            "clarification_question": question,
+        }
+        # Insert BEFORE sending the message so the upsert can't lose to a fast
+        # follow-up reply. The message_id is patched in afterward.
+        upsert_pending(
+            user_id=user_id,
+            chat_id=chat_id,
+            original_text=text[:500],
+            context=new_context,
+            clarification_message_id=None,
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=label("btn_pending_cancel", locale),
+                        callback_data=CB_CANCEL_PENDING,
+                    )
+                ]
+            ]
+        )
+        body_target = pending_target or text[:80]
+        sent = await message.answer(
+            label("clarify_pending", locale, question=question, task=body_target),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        try:
+            update_clarification_message_id(user_id, sent.message_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("pending: failed to bind clarification message id")
         return
 
     if parsed.intent == "cancel":
+        clear_pending(user_id)
         await _handle_cancel_or_done(
             message, bot, user_id, parsed.target_text, mark="cancelled", locale=locale
         )
         return
     if parsed.intent == "done":
+        clear_pending(user_id)
         await _handle_cancel_or_done(
             message, bot, user_id, parsed.target_text, mark="done", locale=locale
         )
         return
     if parsed.intent == "edit":
+        clear_pending(user_id)
         await _handle_edit(
             message,
             bot,
@@ -588,6 +665,9 @@ async def handle_message(message: Message, bot: Bot, router: LLMRouter) -> None:
         if parsed.fire_at is None:
             await message.answer(label("when_clarify", locale))
             return
+        # We have a complete intent — wipe any in-flight pending so the next
+        # free-form message starts fresh.
+        clear_pending(user_id)
         # Persist reminder. Quiet hours push next_ping_at past the current
         # silenced window if necessary; the canonical fire_at is preserved so
         # skip-next / future chains anchor to the user's intended slot.
@@ -739,6 +819,26 @@ async def _handle_cancel_or_done(
 # ---------- callback handlers ----------
 
 
+async def cb_cancel_pending(query: CallbackQuery, bot: Bot) -> None:
+    """Inline-button handler for the Cancel button on a clarification message."""
+    uid = query.from_user.id if query.from_user else 0
+    if not _is_authorized(uid):
+        await _safe_answer(query, "Not authorized.", alert=True)
+        return
+    detected = detect_locale(query.message.text or "" if query.message else "")
+    user_id, locale, _tz = _upsert_user(
+        uid,
+        query.from_user.username if query.from_user else None,
+        detected_locale=detected,
+    )
+    cleared = clear_pending(user_id)
+    msg_key = "pending_cancelled" if cleared else "pending_already_gone"
+    await _strip_buttons_and_append(
+        query, f"\n\n<i>{label('pending_cancelled', locale)}</i>" if cleared else ""
+    )
+    await _safe_answer(query, label(msg_key, locale))
+
+
 async def cb_action(query: CallbackQuery, bot: Bot) -> None:
     if not _is_authorized(query.from_user.id if query.from_user else None):
         await _safe_answer(query, "Not authorized.", alert=True)
@@ -862,6 +962,10 @@ def _build_dispatcher(router: LLMRouter, bot: Bot) -> Dispatcher:
         F.text & ~F.text.startswith("/"),
     )
 
+    dp.callback_query.register(
+        lambda q: cb_cancel_pending(q, bot),
+        F.data == CB_CANCEL_PENDING,
+    )
     dp.callback_query.register(
         lambda q: cb_action(q, bot),
         F.data.func(

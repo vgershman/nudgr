@@ -35,10 +35,11 @@ async def _check_config() -> Check:
         missing.append("TELEGRAM_ADMIN_IDS (or TELEGRAM_USER_ID)")
     if missing:
         return Check("config", False, f"missing env vars: {', '.join(missing)}")
+    mode = "open" if settings.open_registration else "invite-only"
     return Check(
         "config",
         True,
-        f"all required env vars present (admins: {sorted(admins)})",
+        f"all required env vars present (mode={mode}, admins: {sorted(admins)})",
     )
 
 

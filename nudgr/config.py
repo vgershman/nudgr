@@ -41,11 +41,15 @@ class Settings(BaseSettings):
     # existing deployments keep working without an env edit.
     telegram_user_id: int = 0
     # v3: comma-separated Telegram user IDs auto-promoted to active+admin on
-    # /start. Anyone NOT in this set must redeem an invite code. Stored as a
-    # raw string and parsed by `admin_ids()` so pydantic-settings doesn't try
-    # to JSON-decode it.
+    # /start. Stored as a raw string and parsed by `admin_ids()` so
+    # pydantic-settings doesn't try to JSON-decode it.
     #   TELEGRAM_ADMIN_IDS=12345,67890
     telegram_admin_ids: str = ""
+    # v3.1: when True (default), any new user who messages the bot is
+    # auto-activated on first sight — no invite code needed. Flip to False
+    # to require explicit invite redemption (the v3-style private mode).
+    # Admin allowlist + /invite continue to work in either mode.
+    open_registration: bool = True
 
     # --- Scheduler ---
     scheduler_poll_interval_sec: int = 15

@@ -34,6 +34,7 @@ from nudgr.db.models import Reminder, User
 from nudgr.db.session import session_scope
 from nudgr.i18n import label
 from nudgr.observability.logging import logger
+from nudgr.pending import expire_stale as expire_stale_pendings
 from nudgr.quiet import defer_for_user
 from nudgr.recurrence import advance_for_chain, next_occurrence
 
@@ -277,6 +278,12 @@ async def run_scheduler(bot: Bot) -> None:
 
     while True:
         try:
+            # v2.5: cheap maintenance — drop expired clarification pendings
+            # before they can confuse a stale "in 5 minutes" reply hours later.
+            try:
+                expire_stale_pendings()
+            except Exception:  # noqa: BLE001
+                logger.exception("scheduler: pending sweep failed")
             fired = await _tick(bot)
             # After firing, refresh each affected user's pinned summary so the
             # ETA / overdue marker stays fresh.

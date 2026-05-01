@@ -111,6 +111,12 @@ _LABELS: dict[str, dict[str, str]] = {
         "edit_no_match": "No active reminder matches '{hint}'.",
         "btn_skip_next": "⏭ Skip next",
         "decision_skipped": "⏭ Skipped. Next at {at}.",
+        # Clarification context (v2.5)
+        "clarify_pending": "❓ {question}\n\n📌 <i>{task}</i>",
+        "clarify_pending_default_q": "When should I remind you?",
+        "btn_pending_cancel": "❌ Cancel",
+        "pending_cancelled": "⏹ Cancelled — nothing scheduled.",
+        "pending_already_gone": "Nothing pending right now.",
     },
     "ru": {
         "welcome": (
@@ -190,6 +196,12 @@ _LABELS: dict[str, dict[str, str]] = {
         "edit_no_match": "Нет активного напоминания по «{hint}».",
         "btn_skip_next": "⏭ Пропустить",
         "decision_skipped": "⏭ Пропущено. Следующий {at}.",
+        # Clarification context (v2.5)
+        "clarify_pending": "❓ {question}\n\n📌 <i>{task}</i>",
+        "clarify_pending_default_q": "Когда напомнить?",
+        "btn_pending_cancel": "❌ Отмена",
+        "pending_cancelled": "⏹ Отменено — ничего не запланировано.",
+        "pending_already_gone": "Ничего не ожидает уточнения.",
     },
 }
 

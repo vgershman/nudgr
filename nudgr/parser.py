@@ -86,12 +86,21 @@ def _extract_recurrence(raw: dict | None, tz_name: str) -> dict | None:
 
 
 async def parse(
-    user_text: str, router: LLMRouter, *, tz_name: str | None = None
+    user_text: str,
+    router: LLMRouter,
+    *,
+    tz_name: str | None = None,
+    pending_context: dict | None = None,
 ) -> ParsedIntent:
     """Parse a user message into a structured ParsedIntent.
 
     `tz_name` is the user's IANA timezone (resolved from the User row by the
     caller). Falls back to the global settings.timezone when omitted.
+
+    `pending_context` carries the partial intent from a prior turn (target_text,
+    recurrence, fire_at_iso, clarification_question). When present, the LLM is
+    instructed to merge — so a "remind me to test feature" → "in 5 minutes"
+    sequence resolves into a single complete reminder.
     """
     effective_tz = tz_name or settings.timezone
     tz = _user_tz(effective_tz)
@@ -99,7 +108,10 @@ async def parse(
     current_iso = now_local.isoformat(timespec="seconds")
 
     user_prompt = render_user_prompt(
-        user_text=user_text, current_iso=current_iso, user_tz=effective_tz
+        user_text=user_text,
+        current_iso=current_iso,
+        user_tz=effective_tz,
+        pending_context=pending_context,
     )
     response = await router.chat(
         system=SYSTEM_PROMPT,
